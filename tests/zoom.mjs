@@ -20,6 +20,9 @@ writeFileSync(
   join(extension, "worker.js"),
   "chrome.runtime.onInstalled.addListener(() => {});",
 );
+delete process.env.TURSO_DATABASE_URL;
+delete process.env.TURSO_AUTH_TOKEN;
+delete process.env.VERCEL;
 process.env.DB_PATH = join(dir, "test.sqlite");
 process.env.NODE_ENV = "production";
 const { app } = await import("../server/index.js");

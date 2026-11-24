@@ -4,7 +4,7 @@ import { randomBytes, createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { db, all, one, run, transaction } from "./db.js";
+import { all, one, run, transaction } from "./queries.js";
 
 export const app = express();
 app.disable("x-powered-by");
@@ -53,7 +53,10 @@ const safeUser = (u) => ({
   branchId: u.branchId,
 });
 const loginAttempts = new Map();
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+app.get("/api/health", async (req, res) => {
+  await one("SELECT id FROM branches LIMIT 1");
+  res.json({ ok: true });
+});
 app.post("/api/auth/login", async (req, res, next) => {
   try {
     const key = req.ip;
@@ -74,7 +77,7 @@ app.post("/api/auth/login", async (req, res, next) => {
         password: z.string().max(128),
       })
       .parse(req.body);
-    const user = one(
+    const user = await one(
       "SELECT * FROM users WHERE email=? AND active=1",
       email.toLowerCase(),
     );
@@ -83,8 +86,8 @@ app.post("/api/auth/login", async (req, res, next) => {
       fail("Email hoặc mật khẩu chưa đúng.", 401);
     }
     const token = randomBytes(32).toString("hex");
-    run("DELETE FROM sessions WHERE expires<?", now);
-    run(
+    await run("DELETE FROM sessions WHERE expires<?", now);
+    await run(
       "INSERT INTO sessions VALUES (?,?,?)",
       hash(token),
       user.id,
@@ -95,7 +98,8 @@ app.post("/api/auth/login", async (req, res, next) => {
       .cookie("la_session", token, {
         httpOnly: true,
         sameSite: "strict",
-        secure: process.env.COOKIE_SECURE === "true",
+        secure:
+          process.env.VERCEL === "1" || process.env.COOKIE_SECURE === "true",
         maxAge: 12 * 3600000,
         path: "/",
       })
@@ -104,22 +108,22 @@ app.post("/api/auth/login", async (req, res, next) => {
     next(e);
   }
 });
-app.use("/api", (req, res, next) => {
+app.use("/api", async (req, res, next) => {
   const token = tokenFrom(req);
   const user =
     token &&
-    one(
+    (await one(
       "SELECT users.* FROM users JOIN sessions ON users.id=sessions.userId WHERE sessions.token=? AND sessions.expires>? AND users.active=1",
       hash(token),
       Date.now(),
-    );
+    ));
   if (!user)
     return res.status(401).json({ error: "Vui lòng đăng nhập để tiếp tục." });
   req.user = user;
   const requested = Number(req.headers["x-branch-id"] || user.branchId || 1);
   if (
     !Number.isInteger(requested) ||
-    !one("SELECT id FROM branches WHERE id=? AND active=1", requested)
+    !(await one("SELECT id FROM branches WHERE id=? AND active=1", requested))
   )
     return res.status(400).json({ error: "Chi nhánh không hợp lệ." });
   if (user.role !== "admin" && requested !== user.branchId)
@@ -137,9 +141,9 @@ const roles =
       : res
           .status(403)
           .json({ error: "Tài khoản không có quyền thực hiện thao tác này." });
-app.post("/api/auth/logout", (req, res) => {
+app.post("/api/auth/logout", async (req, res) => {
   const token = tokenFrom(req);
-  if (token) run("DELETE FROM sessions WHERE token=?", hash(token));
+  if (token) await run("DELETE FROM sessions WHERE token=?", hash(token));
   res.clearCookie("la_session", { path: "/" }).json({ ok: true });
 });
 app.put("/api/auth/password", async (req, res, next) => {
@@ -152,12 +156,12 @@ app.put("/api/auth/password", async (req, res, next) => {
       .parse(req.body);
     if (!(await bcrypt.compare(currentPassword, req.user.password)))
       fail("Mật khẩu hiện tại chưa đúng.");
-    run(
+    await run(
       "UPDATE users SET password=? WHERE id=?",
       await bcrypt.hash(newPassword, 10),
       req.user.id,
     );
-    run(
+    await run(
       "DELETE FROM sessions WHERE userId=? AND token<>?",
       req.user.id,
       hash(tokenFrom(req)),
@@ -167,79 +171,90 @@ app.put("/api/auth/password", async (req, res, next) => {
     next(e);
   }
 });
-function getOrders(branchId) {
-  const items = all("SELECT * FROM order_items ORDER BY id");
-  return all(
-    "SELECT orders.*,dining_tables.name AS tableName,customers.name AS customerName,users.name AS staffName FROM orders LEFT JOIN dining_tables ON orders.tableId=dining_tables.id LEFT JOIN customers ON orders.customerId=customers.id JOIN users ON users.id=orders.staffId WHERE orders.branchId=? ORDER BY orders.id DESC",
-    branchId,
+async function getOrders(branchId) {
+  const items = await all("SELECT * FROM order_items ORDER BY id");
+  return (
+    await all(
+      "SELECT orders.*,dining_tables.name AS tableName,customers.name AS customerName,users.name AS staffName FROM orders LEFT JOIN dining_tables ON orders.tableId=dining_tables.id LEFT JOIN customers ON orders.customerId=customers.id JOIN users ON users.id=orders.staffId WHERE orders.branchId=? ORDER BY orders.id DESC",
+      branchId,
+    )
   ).map((o) => ({ ...o, items: items.filter((i) => i.orderId === o.id) }));
 }
-function branchIngredients(branchId) {
-  return all(
-    "SELECT ingredients.*,branch_stock.stock,branch_stock.threshold FROM ingredients JOIN branch_stock ON ingredients.id=branch_stock.ingredientId WHERE branch_stock.branchId=?",
+async function branchIngredients(branchId) {
+  return await all(
+    "SELECT ingredients.id,ingredients.name,ingredients.unit,ingredients.cost,branch_stock.stock,branch_stock.threshold FROM ingredients JOIN branch_stock ON ingredients.id=branch_stock.ingredientId WHERE branch_stock.branchId=?",
     branchId,
   );
 }
-app.get("/api/bootstrap", (req, res) =>
+app.get("/api/bootstrap", async (req, res) =>
   res.json({
     user: safeUser(req.user),
     branchId: req.branchId,
-    branches: all("SELECT * FROM branches WHERE active=1").filter(
+    branches: (await all("SELECT * FROM branches WHERE active=1")).filter(
       (b) => req.user.role === "admin" || b.id === req.user.branchId,
     ),
-    settings: one("SELECT * FROM settings WHERE id=?", req.branchId),
-    products: all("SELECT * FROM products"),
-    ingredients: branchIngredients(req.branchId),
-    recipes: all("SELECT * FROM recipes"),
-    tables: all("SELECT * FROM dining_tables WHERE branchId=?", req.branchId),
+    settings: await one("SELECT * FROM settings WHERE id=?", req.branchId),
+    products: await all("SELECT * FROM products"),
+    ingredients: await branchIngredients(req.branchId),
+    recipes: await all("SELECT * FROM recipes"),
+    tables: await all(
+      "SELECT * FROM dining_tables WHERE branchId=?",
+      req.branchId,
+    ),
     customers:
       req.user.role === "kitchen"
         ? []
-        : all("SELECT * FROM customers ORDER BY id DESC"),
+        : await all("SELECT * FROM customers ORDER BY id DESC"),
     users:
       req.user.role === "admin"
-        ? all("SELECT id,name,email,role,active,phone,branchId FROM users")
+        ? await all(
+            "SELECT id,name,email,role,active,phone,branchId FROM users",
+          )
         : [],
-    orders: getOrders(req.branchId).filter(
+    orders: (await getOrders(req.branchId)).filter(
       (o) =>
         req.user.role !== "kitchen" ||
         !["completed", "cancelled"].includes(o.status),
     ),
     movements:
       req.user.role === "admin"
-        ? all(
+        ? await all(
             "SELECT stock_movements.*,ingredients.name,ingredients.unit,users.name AS staffName FROM stock_movements JOIN ingredients ON ingredients.id=stock_movements.ingredientId JOIN users ON users.id=stock_movements.staffId WHERE stock_movements.branchId=? ORDER BY stock_movements.id DESC LIMIT 100",
             req.branchId,
           )
         : [],
   }),
 );
-app.get("/api/chain", roles("admin"), (req, res) =>
+app.get("/api/chain", roles("admin"), async (req, res) =>
   res.json({
-    branches: all("SELECT * FROM branches WHERE active=1").map((b) => ({
-      ...b,
-      orders: getOrders(b.id),
-      ingredients: branchIngredients(b.id),
-      tables: all("SELECT * FROM dining_tables WHERE branchId=?", b.id),
-    })),
+    branches: await Promise.all(
+      (await all("SELECT * FROM branches WHERE active=1")).map(async (b) => ({
+        ...b,
+        orders: await getOrders(b.id),
+        ingredients: await branchIngredients(b.id),
+        tables: await all("SELECT * FROM dining_tables WHERE branchId=?", b.id),
+      })),
+    ),
   }),
 );
-app.post("/api/branches", roles("admin"), (req, res) => {
+app.post("/api/branches", roles("admin"), async (req, res) => {
   const b = z
     .object({ name: text, address: text, phone: z.string().min(8).max(20) })
     .parse(req.body);
-  if (one("SELECT id FROM branches WHERE name=?", b.name))
+  if (await one("SELECT id FROM branches WHERE name=?", b.name))
     fail("Tên chi nhánh đã tồn tại.");
-  const id = transaction(() => {
+  const id = await transaction(async () => {
     const id = Number(
-      run(
-        "INSERT INTO branches (name,address,phone) VALUES (?,?,?)",
-        b.name,
-        b.address,
-        b.phone,
+      (
+        await run(
+          "INSERT INTO branches (name,address,phone) VALUES (?,?,?)",
+          b.name,
+          b.address,
+          b.phone,
+        )
       ).lastInsertRowid,
     );
-    run(
+    await run(
       "INSERT INTO settings VALUES (?,?,?,?,?,?)",
       id,
       "Lá Coffee & Kitchen",
@@ -248,8 +263,8 @@ app.post("/api/branches", roles("admin"), (req, res) => {
       8,
       "Cảm ơn bạn đã ghé Lá!",
     );
-    for (const i of all("SELECT * FROM ingredients"))
-      run(
+    for (const i of await all("SELECT * FROM ingredients"))
+      await run(
         "INSERT INTO branch_stock VALUES (?,?,?,?)",
         id,
         i.id,
@@ -260,7 +275,7 @@ app.post("/api/branches", roles("admin"), (req, res) => {
   });
   res.status(201).json({ id });
 });
-app.post("/api/stock/transfer", roles("admin"), (req, res) => {
+app.post("/api/stock/transfer", roles("admin"), async (req, res) => {
   const b = z
     .object({
       ingredientId: z.number().int().positive(),
@@ -269,12 +284,17 @@ app.post("/api/stock/transfer", roles("admin"), (req, res) => {
       reason: z.string().trim().min(3).max(500),
     })
     .parse(req.body);
-  transaction(() => {
+  await transaction(async () => {
     if (b.toBranchId === req.branchId)
       fail("Chọn chi nhánh nhận khác chi nhánh xuất.");
-    if (!one("SELECT id FROM branches WHERE id=? AND active=1", b.toBranchId))
+    if (
+      !(await one(
+        "SELECT id FROM branches WHERE id=? AND active=1",
+        b.toBranchId,
+      ))
+    )
       fail("Chi nhánh nhận không hợp lệ.");
-    const source = one(
+    const source = await one(
       "SELECT stock FROM branch_stock WHERE branchId=? AND ingredientId=?",
       req.branchId,
       b.ingredientId,
@@ -285,13 +305,13 @@ app.post("/api/stock/transfer", roles("admin"), (req, res) => {
       [req.branchId, -b.quantity],
       [b.toBranchId, b.quantity],
     ]) {
-      run(
+      await run(
         "UPDATE branch_stock SET stock=ROUND(stock+?,6) WHERE branchId=? AND ingredientId=?",
         quantity,
         branchId,
         b.ingredientId,
       );
-      run(
+      await run(
         "INSERT INTO stock_movements (ingredientId,quantity,reason,createdAt,staffId,branchId) VALUES (?,?,?,?,?,?)",
         b.ingredientId,
         quantity,
@@ -322,11 +342,11 @@ const orderSchema = z.object({
     .min(1)
     .max(100),
 });
-app.post("/api/orders", roles("admin", "cashier"), (req, res) => {
+app.post("/api/orders", roles("admin", "cashier"), async (req, res) => {
   const body = orderSchema.parse(req.body);
-  const result = transaction(() => {
+  const result = await transaction(async () => {
     if (body.requestKey) {
-      const existing = one(
+      const existing = await one(
         "SELECT * FROM order_requests WHERE requestKey=?",
         body.requestKey,
       );
@@ -346,15 +366,15 @@ app.post("/api/orders", roles("admin", "cashier"), (req, res) => {
     if (body.type === "dinein") {
       if (!body.tableId) fail("Vui lòng chọn bàn.");
       if (
-        !one(
+        !(await one(
           "SELECT id FROM dining_tables WHERE id=? AND branchId=?",
           body.tableId,
           req.branchId,
-        )
+        ))
       )
         fail("Bàn không tồn tại.");
       if (
-        one(
+        await one(
           "SELECT id FROM orders WHERE tableId=? AND status NOT IN ('completed','cancelled')",
           body.tableId,
         )
@@ -363,36 +383,43 @@ app.post("/api/orders", roles("admin", "cashier"), (req, res) => {
     }
     if (
       body.customerId &&
-      !one("SELECT id FROM customers WHERE id=?", body.customerId)
+      !(await one("SELECT id FROM customers WHERE id=?", body.customerId))
     )
       fail("Khách hàng không tồn tại.");
     const combined = new Map();
     for (const i of body.items)
       combined.set(i.productId, (combined.get(i.productId) || 0) + i.quantity);
-    const items = [...combined].map(([id, quantity]) => {
+    const items = [];
+    for (const [id, quantity] of combined) {
       if (quantity > 100) fail("Số lượng mỗi món tối đa 100.");
-      const p = one("SELECT * FROM products WHERE id=? AND available=1", id);
+      const p = await one(
+        "SELECT * FROM products WHERE id=? AND available=1",
+        id,
+      );
       if (!p) fail("Một món đã ngừng bán. Vui lòng tải lại thực đơn.");
-      return { ...p, quantity };
-    });
+      items.push({ ...p, quantity });
+    }
     const subtotal = items.reduce((s, p) => s + p.price * p.quantity, 0);
     if (body.discount > subtotal)
       fail("Giảm giá không được vượt quá tạm tính.");
     const tax = Math.round(
       ((subtotal - body.discount) *
-        one("SELECT tax FROM settings WHERE id=?", req.branchId).tax) /
+        (await one("SELECT tax FROM settings WHERE id=?", req.branchId)).tax) /
         100,
     );
     const needs = new Map();
     for (const item of items)
-      for (const r of all("SELECT * FROM recipes WHERE productId=?", item.id))
+      for (const r of await all(
+        "SELECT * FROM recipes WHERE productId=?",
+        item.id,
+      ))
         needs.set(
           r.ingredientId,
           (needs.get(r.ingredientId) || 0) + r.quantity * item.quantity,
         );
     for (const [id, quantity] of needs) {
-      const i = one(
-        "SELECT ingredients.*,branch_stock.stock FROM ingredients JOIN branch_stock ON ingredients.id=branch_stock.ingredientId WHERE ingredients.id=? AND branch_stock.branchId=?",
+      const i = await one(
+        "SELECT ingredients.name,branch_stock.stock FROM ingredients JOIN branch_stock ON ingredients.id=branch_stock.ingredientId WHERE ingredients.id=? AND branch_stock.branchId=?",
         id,
         req.branchId,
       );
@@ -403,24 +430,26 @@ app.post("/api/orders", roles("admin", "cashier"), (req, res) => {
         );
     }
     const id = Number(
-      run(
-        "INSERT INTO orders (type,tableId,customerId,status,subtotal,discount,tax,total,note,createdAt,staffId,branchId) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        body.type,
-        body.type === "dinein" ? body.tableId : null,
-        body.customerId || null,
-        "pending",
-        subtotal,
-        body.discount,
-        tax,
-        subtotal - body.discount + tax,
-        body.note,
-        new Date().toISOString(),
-        req.user.id,
-        req.branchId,
+      (
+        await run(
+          "INSERT INTO orders (type,tableId,customerId,status,subtotal,discount,tax,total,note,createdAt,staffId,branchId) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+          body.type,
+          body.type === "dinein" ? body.tableId : null,
+          body.customerId || null,
+          "pending",
+          subtotal,
+          body.discount,
+          tax,
+          subtotal - body.discount + tax,
+          body.note,
+          new Date().toISOString(),
+          req.user.id,
+          req.branchId,
+        )
       ).lastInsertRowid,
     );
     for (const i of items)
-      run(
+      await run(
         "INSERT INTO order_items (orderId,productId,name,price,cost,quantity) VALUES (?,?,?,?,?,?)",
         id,
         i.id,
@@ -430,14 +459,19 @@ app.post("/api/orders", roles("admin", "cashier"), (req, res) => {
         i.quantity,
       );
     for (const [ingredientId, quantity] of needs) {
-      run(
+      await run(
         "UPDATE branch_stock SET stock=ROUND(stock-?,6) WHERE ingredientId=? AND branchId=?",
         quantity,
         ingredientId,
         req.branchId,
       );
-      run("INSERT INTO order_stock VALUES (?,?,?)", id, ingredientId, quantity);
-      run(
+      await run(
+        "INSERT INTO order_stock VALUES (?,?,?)",
+        id,
+        ingredientId,
+        quantity,
+      );
+      await run(
         "INSERT INTO stock_movements (ingredientId,quantity,reason,createdAt,staffId,branchId) VALUES (?,?,?,?,?,?)",
         ingredientId,
         -quantity,
@@ -448,9 +482,12 @@ app.post("/api/orders", roles("admin", "cashier"), (req, res) => {
       );
     }
     if (body.type === "dinein")
-      run("UPDATE dining_tables SET reserved='' WHERE id=?", body.tableId);
+      await run(
+        "UPDATE dining_tables SET reserved='' WHERE id=?",
+        body.tableId,
+      );
     if (body.requestKey)
-      run(
+      await run(
         "INSERT INTO order_requests VALUES (?,?,?,?,?)",
         body.requestKey,
         id,
@@ -462,13 +499,13 @@ app.post("/api/orders", roles("admin", "cashier"), (req, res) => {
   });
   res.status(201).json(result);
 });
-app.patch("/api/orders/:id/status", (req, res) => {
+app.patch("/api/orders/:id/status", async (req, res) => {
   const id = idOf(req.params.id);
   const { status } = z
     .object({ status: z.enum(["cooking", "ready", "served", "cancelled"]) })
     .parse(req.body);
-  transaction(() => {
-    const order = one(
+  await transaction(async () => {
+    const order = await one(
       "SELECT * FROM orders WHERE id=? AND branchId=?",
       id,
       req.branchId,
@@ -485,14 +522,17 @@ app.patch("/api/orders/:id/status", (req, res) => {
     if (!transitions[order.status]?.includes(status))
       fail("Trạng thái đã thay đổi. Vui lòng tải lại.", 409);
     if (status === "cancelled")
-      for (const r of all("SELECT * FROM order_stock WHERE orderId=?", id)) {
-        run(
+      for (const r of await all(
+        "SELECT * FROM order_stock WHERE orderId=?",
+        id,
+      )) {
+        await run(
           "UPDATE branch_stock SET stock=ROUND(stock+?,6) WHERE ingredientId=? AND branchId=?",
           r.quantity,
           r.ingredientId,
           req.branchId,
         );
-        run(
+        await run(
           "INSERT INTO stock_movements (ingredientId,quantity,reason,createdAt,staffId,branchId) VALUES (?,?,?,?,?,?)",
           r.ingredientId,
           r.quantity,
@@ -502,11 +542,11 @@ app.patch("/api/orders/:id/status", (req, res) => {
           req.branchId,
         );
       }
-    run("UPDATE orders SET status=? WHERE id=?", status, id);
+    await run("UPDATE orders SET status=? WHERE id=?", status, id);
   });
   res.json({ ok: true });
 });
-app.post("/api/orders/:id/pay", roles("admin", "cashier"), (req, res) => {
+app.post("/api/orders/:id/pay", roles("admin", "cashier"), async (req, res) => {
   const id = idOf(req.params.id);
   const body = z
     .object({
@@ -514,8 +554,8 @@ app.post("/api/orders/:id/pay", roles("admin", "cashier"), (req, res) => {
       received: money.optional(),
     })
     .parse(req.body);
-  transaction(() => {
-    const order = one(
+  await transaction(async () => {
+    const order = await one(
       "SELECT * FROM orders WHERE id=? AND branchId=?",
       id,
       req.branchId,
@@ -525,7 +565,7 @@ app.post("/api/orders/:id/pay", roles("admin", "cashier"), (req, res) => {
       fail("Chỉ thanh toán khi món đã sẵn sàng hoặc đã phục vụ.", 409);
     if (body.payment === "cash" && (body.received ?? 0) < order.total)
       fail("Số tiền khách đưa chưa đủ.");
-    run(
+    await run(
       "UPDATE orders SET status=?,payment=?,received=?,paidAt=? WHERE id=?",
       "completed",
       body.payment,
@@ -534,7 +574,7 @@ app.post("/api/orders/:id/pay", roles("admin", "cashier"), (req, res) => {
       id,
     );
     if (order.customerId)
-      run(
+      await run(
         "UPDATE customers SET spent=spent+?,visits=visits+1,points=points+? WHERE id=?",
         order.total,
         Math.floor(order.total / 10000),
@@ -543,40 +583,44 @@ app.post("/api/orders/:id/pay", roles("admin", "cashier"), (req, res) => {
   });
   res.json({ ok: true });
 });
-app.patch("/api/orders/:id/table", roles("admin", "cashier"), (req, res) => {
-  const id = idOf(req.params.id);
-  const tableId = idOf(req.body.tableId);
-  transaction(() => {
-    const order = one(
-      "SELECT * FROM orders WHERE id=? AND branchId=?",
-      id,
-      req.branchId,
-    );
-    if (
-      !order ||
-      order.type !== "dinein" ||
-      ["completed", "cancelled"].includes(order.status)
-    )
-      fail("Đơn không thể chuyển bàn.");
-    if (
-      !one(
-        "SELECT id FROM dining_tables WHERE id=? AND reserved='' AND branchId=?",
-        tableId,
+app.patch(
+  "/api/orders/:id/table",
+  roles("admin", "cashier"),
+  async (req, res) => {
+    const id = idOf(req.params.id);
+    const tableId = idOf(req.body.tableId);
+    await transaction(async () => {
+      const order = await one(
+        "SELECT * FROM orders WHERE id=? AND branchId=?",
+        id,
         req.branchId,
+      );
+      if (
+        !order ||
+        order.type !== "dinein" ||
+        ["completed", "cancelled"].includes(order.status)
       )
-    )
-      fail("Bàn không khả dụng.");
-    if (
-      one(
-        "SELECT id FROM orders WHERE tableId=? AND status NOT IN ('completed','cancelled')",
-        tableId,
+        fail("Đơn không thể chuyển bàn.");
+      if (
+        !(await one(
+          "SELECT id FROM dining_tables WHERE id=? AND reserved='' AND branchId=?",
+          tableId,
+          req.branchId,
+        ))
       )
-    )
-      fail("Bàn đã có khách.", 409);
-    run("UPDATE orders SET tableId=? WHERE id=?", tableId, id);
-  });
-  res.json({ ok: true });
-});
+        fail("Bàn không khả dụng.");
+      if (
+        await one(
+          "SELECT id FROM orders WHERE tableId=? AND status NOT IN ('completed','cancelled')",
+          tableId,
+        )
+      )
+        fail("Bàn đã có khách.", 409);
+      await run("UPDATE orders SET tableId=? WHERE id=?", tableId, id);
+    });
+    res.json({ ok: true });
+  },
+);
 
 const productSchema = z.object({
   name: text,
@@ -603,20 +647,20 @@ const productSchema = z.object({
     .max(50)
     .default([]),
 });
-function saveProduct(req, res) {
+async function saveProduct(req, res) {
   const b = productSchema.parse(req.body);
   const id = req.params.id ? idOf(req.params.id) : null;
-  const result = transaction(() => {
-    if (id && !one("SELECT id FROM products WHERE id=?", id))
+  const result = await transaction(async () => {
+    if (id && !(await one("SELECT id FROM products WHERE id=?", id)))
       fail("Không tìm thấy món.", 404);
     if (new Set(b.recipe.map((r) => r.ingredientId)).size !== b.recipe.length)
       fail("Nguyên liệu bị trùng trong công thức.");
     for (const r of b.recipe)
-      if (!one("SELECT id FROM ingredients WHERE id=?", r.ingredientId))
+      if (!(await one("SELECT id FROM ingredients WHERE id=?", r.ingredientId)))
         fail("Nguyên liệu không tồn tại.");
     let productId = id;
     if (id)
-      run(
+      await run(
         "UPDATE products SET name=?,category=?,price=?,cost=?,image=?,description=?,available=? WHERE id=?",
         b.name,
         b.category,
@@ -629,20 +673,22 @@ function saveProduct(req, res) {
       );
     else
       productId = Number(
-        run(
-          "INSERT INTO products (name,category,price,cost,image,description,available) VALUES (?,?,?,?,?,?,?)",
-          b.name,
-          b.category,
-          b.price,
-          b.cost,
-          b.image,
-          b.description,
-          +b.available,
+        (
+          await run(
+            "INSERT INTO products (name,category,price,cost,image,description,available) VALUES (?,?,?,?,?,?,?)",
+            b.name,
+            b.category,
+            b.price,
+            b.cost,
+            b.image,
+            b.description,
+            +b.available,
+          )
         ).lastInsertRowid,
       );
-    run("DELETE FROM recipes WHERE productId=?", productId);
+    await run("DELETE FROM recipes WHERE productId=?", productId);
     for (const r of b.recipe)
-      run(
+      await run(
         "INSERT INTO recipes VALUES (?,?,?)",
         productId,
         r.ingredientId,
@@ -654,7 +700,7 @@ function saveProduct(req, res) {
 }
 app.post("/api/products", roles("admin"), saveProduct);
 app.put("/api/products/:id", roles("admin"), saveProduct);
-app.post("/api/ingredients", roles("admin"), (req, res) => {
+app.post("/api/ingredients", roles("admin"), async (req, res) => {
   const b = z
     .object({
       name: text,
@@ -664,18 +710,20 @@ app.post("/api/ingredients", roles("admin"), (req, res) => {
       cost: money,
     })
     .parse(req.body);
-  const id = transaction(() => {
+  const id = await transaction(async () => {
     const id = Number(
-      run(
-        "INSERT INTO ingredients (name,unit,stock,threshold,cost) VALUES (?,?,?,?,?)",
-        b.name,
-        b.unit,
-        b.stock,
-        b.threshold,
-        b.cost,
+      (
+        await run(
+          "INSERT INTO ingredients (name,unit,stock,threshold,cost) VALUES (?,?,?,?,?)",
+          b.name,
+          b.unit,
+          b.stock,
+          b.threshold,
+          b.cost,
+        )
       ).lastInsertRowid,
     );
-    run(
+    await run(
       "INSERT INTO stock_movements (ingredientId,quantity,reason,createdAt,staffId,branchId) VALUES (?,?,?,?,?,?)",
       id,
       b.stock,
@@ -684,8 +732,8 @@ app.post("/api/ingredients", roles("admin"), (req, res) => {
       req.user.id,
       req.branchId,
     );
-    for (const branch of all("SELECT id FROM branches"))
-      run(
+    for (const branch of await all("SELECT id FROM branches"))
+      await run(
         "INSERT INTO branch_stock VALUES (?,?,?,?)",
         branch.id,
         id,
@@ -696,7 +744,7 @@ app.post("/api/ingredients", roles("admin"), (req, res) => {
   });
   res.status(201).json({ id });
 });
-app.post("/api/stock", roles("admin"), (req, res) => {
+app.post("/api/stock", roles("admin"), async (req, res) => {
   const b = z
     .object({
       ingredientId: z.number().int().positive(),
@@ -708,21 +756,21 @@ app.post("/api/stock", roles("admin"), (req, res) => {
       reason: z.string().trim().min(3).max(500),
     })
     .parse(req.body);
-  transaction(() => {
-    const i = one(
+  await transaction(async () => {
+    const i = await one(
       "SELECT * FROM branch_stock WHERE ingredientId=? AND branchId=?",
       b.ingredientId,
       req.branchId,
     );
     if (!i) fail("Nguyên liệu không tồn tại.", 404);
     if (i.stock + b.quantity < 0) fail("Tồn kho không thể âm.");
-    run(
+    await run(
       "UPDATE branch_stock SET stock=ROUND(stock+?,6) WHERE ingredientId=? AND branchId=?",
       b.quantity,
       b.ingredientId,
       req.branchId,
     );
-    run(
+    await run(
       "INSERT INTO stock_movements (ingredientId,quantity,reason,createdAt,staffId,branchId) VALUES (?,?,?,?,?,?)",
       b.ingredientId,
       b.quantity,
@@ -739,15 +787,21 @@ const customerSchema = z.object({
   phone: z.string().regex(/^[+\d][\d\s-]{8,14}$/),
   email: z.union([z.string().email().max(160), z.literal("")]).default(""),
 });
-function saveCustomer(req, res) {
+async function saveCustomer(req, res) {
   const b = customerSchema.parse(req.body);
   const id = req.params.id ? idOf(req.params.id) : null;
-  if (one("SELECT id FROM customers WHERE phone=? AND id<>?", b.phone, id || 0))
+  if (
+    await one(
+      "SELECT id FROM customers WHERE phone=? AND id<>?",
+      b.phone,
+      id || 0,
+    )
+  )
     fail("Số điện thoại đã được sử dụng.");
   if (id) {
-    if (!one("SELECT id FROM customers WHERE id=?", id))
+    if (!(await one("SELECT id FROM customers WHERE id=?", id)))
       fail("Không tìm thấy khách hàng.", 404);
-    run(
+    await run(
       "UPDATE customers SET name=?,phone=?,email=? WHERE id=?",
       b.name,
       b.phone,
@@ -755,7 +809,7 @@ function saveCustomer(req, res) {
       id,
     );
   } else {
-    const result = run(
+    const result = await run(
       "INSERT INTO customers (name,phone,email) VALUES (?,?,?)",
       b.name,
       b.phone,
@@ -767,19 +821,19 @@ function saveCustomer(req, res) {
 }
 app.post("/api/customers", roles("admin", "cashier"), saveCustomer);
 app.put("/api/customers/:id", roles("admin", "cashier"), saveCustomer);
-app.post("/api/tables", roles("admin"), (req, res) => {
+app.post("/api/tables", roles("admin"), async (req, res) => {
   const b = z
     .object({ name: text, zone: text, seats: z.number().int().min(1).max(50) })
     .parse(req.body);
   if (
-    one(
+    await one(
       "SELECT id FROM dining_tables WHERE name=? AND branchId=?",
       b.name,
       req.branchId,
     )
   )
     fail("Tên bàn đã tồn tại.");
-  const result = run(
+  const result = await run(
     "INSERT INTO dining_tables (name,zone,seats,branchId) VALUES (?,?,?,?)",
     b.name,
     b.zone,
@@ -788,25 +842,25 @@ app.post("/api/tables", roles("admin"), (req, res) => {
   );
   res.status(201).json({ id: Number(result.lastInsertRowid) });
 });
-app.patch("/api/tables/:id", roles("admin", "cashier"), (req, res) => {
+app.patch("/api/tables/:id", roles("admin", "cashier"), async (req, res) => {
   const id = idOf(req.params.id);
   const reserved = z.string().trim().max(250).parse(req.body.reserved);
   if (
-    !one(
+    !(await one(
       "SELECT id FROM dining_tables WHERE id=? AND branchId=?",
       id,
       req.branchId,
-    )
+    ))
   )
     fail("Không tìm thấy bàn.", 404);
   if (
-    one(
+    await one(
       "SELECT id FROM orders WHERE tableId=? AND status NOT IN ('completed','cancelled')",
       id,
     )
   )
     fail("Bàn đang phục vụ.", 409);
-  run("UPDATE dining_tables SET reserved=? WHERE id=?", reserved, id);
+  await run("UPDATE dining_tables SET reserved=? WHERE id=?", reserved, id);
   res.json({ ok: true });
 });
 const staffSchema = z.object({
@@ -828,19 +882,28 @@ async function saveStaff(req, res, next) {
     const id = req.params.id ? idOf(req.params.id) : null;
     if (b.role !== "admin" && !b.branchId)
       fail("Nhân viên phải được phân công chi nhánh.");
-    if (b.branchId && !one("SELECT id FROM branches WHERE id=?", b.branchId))
+    if (
+      b.branchId &&
+      !(await one("SELECT id FROM branches WHERE id=?", b.branchId))
+    )
       fail("Chi nhánh không tồn tại.");
     if (id === req.user.id && (!b.active || b.role !== "admin"))
       fail("Bạn không thể tự khóa hoặc đổi quyền quản trị của mình.");
-    if (one("SELECT id FROM users WHERE email=? AND id<>?", b.email, id || 0))
+    if (
+      await one(
+        "SELECT id FROM users WHERE email=? AND id<>?",
+        b.email,
+        id || 0,
+      )
+    )
       fail("Email đã được sử dụng.");
-    if (id && !one("SELECT id FROM users WHERE id=?", id))
+    if (id && !(await one("SELECT id FROM users WHERE id=?", id)))
       fail("Không tìm thấy nhân viên.", 404);
     if (!id && !b.password) fail("Vui lòng nhập mật khẩu cho nhân viên mới.");
     const password = b.password ? await bcrypt.hash(b.password, 10) : null;
-    transaction(() => {
+    await transaction(async () => {
       if (id) {
-        run(
+        await run(
           "UPDATE users SET name=?,email=?,phone=?,role=?,active=?,branchId=? WHERE id=?",
           b.name,
           b.email,
@@ -851,14 +914,14 @@ async function saveStaff(req, res, next) {
           id,
         );
         if (password)
-          run("UPDATE users SET password=? WHERE id=?", password, id);
-        run(
+          await run("UPDATE users SET password=? WHERE id=?", password, id);
+        await run(
           "DELETE FROM sessions WHERE userId=? AND userId<>?",
           id,
           req.user.id,
         );
       } else
-        run(
+        await run(
           "INSERT INTO users (name,email,phone,role,active,password,branchId) VALUES (?,?,?,?,?,?,?)",
           b.name,
           b.email,
@@ -876,7 +939,7 @@ async function saveStaff(req, res, next) {
 }
 app.post("/api/users", roles("admin"), saveStaff);
 app.put("/api/users/:id", roles("admin"), saveStaff);
-app.put("/api/settings", roles("admin"), (req, res) => {
+app.put("/api/settings", roles("admin"), async (req, res) => {
   const b = z
     .object({
       name: text,
@@ -886,8 +949,8 @@ app.put("/api/settings", roles("admin"), (req, res) => {
       receiptNote: z.string().max(500),
     })
     .parse(req.body);
-  transaction(() => {
-    run(
+  await transaction(async () => {
+    await run(
       "UPDATE settings SET name=?,address=?,phone=?,tax=?,receiptNote=? WHERE id=?",
       b.name,
       b.address,
@@ -896,7 +959,7 @@ app.put("/api/settings", roles("admin"), (req, res) => {
       b.receiptNote,
       req.branchId,
     );
-    run(
+    await run(
       "UPDATE branches SET address=?,phone=? WHERE id=?",
       b.address,
       b.phone,

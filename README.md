@@ -128,3 +128,9 @@ public/fonts/             Be Vietnam Pro + giấy phép OFL
 ```
 
 Ảnh minh họa được tải từ Unsplash; nguồn chi tiết trong `public/images/SOURCES.md`. Font Be Vietnam Pro phát hành theo SIL Open Font License, kèm giấy phép trong thư mục font.
+
+## Triển khai trên Vercel
+
+Vercel phục vụ giao diện Vite và chuyển các yêu cầu `/api/*` đến Express. Dữ liệu trên Vercel được lưu trong Turso. Kết nối Turso với môi trường Production và cấu hình `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN` phía máy chủ. Trên máy tin cậy đã có hai biến này, chạy `node scripts/init-turso.mjs` một lần trước khi triển khai. Script tạo schema và dữ liệu mẫu trong một transaction, bỏ qua database đã khởi tạo và không đọc file SQLite vận hành. Có thể đặt `ADMIN_PASSWORD` khi khởi tạo để thay mật khẩu mặc định cho các tài khoản mẫu.
+
+Kiểm tra `/api/health` sau khi triển khai để xác nhận Vercel đọc được database. Lệnh `npm run backup` dùng cho SQLite cục bộ.

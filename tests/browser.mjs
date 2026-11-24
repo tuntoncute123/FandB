@@ -11,6 +11,9 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 const directory = mkdtempSync(join(tmpdir(), "la-fnb-browser-"));
+delete process.env.TURSO_DATABASE_URL;
+delete process.env.TURSO_AUTH_TOKEN;
+delete process.env.VERCEL;
 process.env.DB_PATH = join(directory, "test.sqlite");
 process.env.NODE_ENV = "production";
 const { app } = await import("../server/index.js");
